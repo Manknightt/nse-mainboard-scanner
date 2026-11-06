@@ -14,6 +14,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -241,7 +242,34 @@ def extract_ticker_frame(download: pd.DataFrame, ticker: str) -> Optional[pd.Dat
         return None
     return frame
 
-def download_and_build(universe: pd.DataFrame) -> pd.DataFrame:
+def _session_dates(index) -> pd.Index:
+    """Return exchange-local calendar dates for yfinance daily bars."""
+    idx = pd.DatetimeIndex(pd.to_datetime(index))
+    if idx.tz is not None:
+        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    return pd.Index(idx.date)
+
+def get_previous_nse_session() -> datetime.date:
+    """Use NIFTY 50 daily history as the market-session calendar.
+
+    The scanner runs before the current day's market open. The most recent
+    NIFTY session strictly before today's IST date is the target EOD session.
+    If the benchmark history is stale/unavailable, fail closed.
+    """
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    benchmark = yf.download("^NSEI", period="15d", interval="1d",
+                             auto_adjust=False, progress=False, threads=False)
+    if benchmark is None or benchmark.empty:
+        raise RuntimeError("Cannot determine previous NSE session: NIFTY 50 history unavailable.")
+    dates = _session_dates(benchmark.index)
+    eligible = [d for d in dates if d < today]
+    if not eligible:
+        raise RuntimeError("Cannot determine previous NSE session: no benchmark date before today.")
+    target = max(eligible)
+    LOG.info("Target EOD session (NIFTY 50): %s", target.isoformat())
+    return target
+
+def download_and_build(universe: pd.DataFrame, target_session) -> pd.DataFrame:
     symbols = universe["Symbol"].tolist()
     tickers = [f"{s}.NS" for s in symbols]
     rows = []
@@ -250,7 +278,7 @@ def download_and_build(universe: pd.DataFrame) -> pd.DataFrame:
         batch = tickers[start:start+40]
         LOG.info("Downloading price history %d-%d of %d", start+1, min(start+len(batch),len(tickers)),len(tickers))
         try:
-            data = yf.download(batch, period="2y", interval="1d", auto_adjust=True,
+            data = yf.download(batch, period="2y", interval="1d", auto_adjust=False,
                                group_by="column", threads=True, progress=False,
                                prepost=False, timeout=30)
         except Exception as exc:
@@ -270,6 +298,8 @@ def download_and_build(universe: pd.DataFrame) -> pd.DataFrame:
                 LOG.exception("Indicator calculation failed for %s", symbol)
         time.sleep(1)
     result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result[result["Date"] == target_session.isoformat()].copy()
     for col in COLUMNS:
         if col not in result.columns:
             result[col] = np.nan
@@ -283,24 +313,27 @@ def download_and_build(universe: pd.DataFrame) -> pd.DataFrame:
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     universe = fetch_universe()
-    result = download_and_build(universe)
+    target_session = get_previous_nse_session()
+    result = download_and_build(universe, target_session)
     if result.empty:
         raise RuntimeError("No stock data was produced; output not written.")
     # Fail closed if the provider returns a suspiciously small subset.
     coverage = len(result) / len(universe)
     LOG.info("Coverage: %d/%d (%.1f%%)", len(result), len(universe), coverage*100)
-    if coverage < 0.70:
-        raise RuntimeError(f"Only {coverage:.1%} of NSE universe downloaded; refusing to replace output.")
-    # Name the archive using the actual EOD session represented in the data,
-    # not the calendar date on which the morning workflow happens to run.
-    session_dates = pd.to_datetime(result["Date"], errors="coerce").dropna()
-    if session_dates.empty:
-        raise RuntimeError("No valid trading-session dates in output.")
-    eod_date = session_dates.max().strftime("%Y-%m-%d")
-    # Require a single common EOD date to avoid silently mixing sessions.
-    date_counts = session_dates.dt.strftime("%Y-%m-%d").value_counts()
-    if len(date_counts) > 1:
-        LOG.warning("Output contains multiple last-session dates: %s", date_counts.head(10).to_dict())
+    if coverage < 0.95:
+        missing = sorted(set(universe["Symbol"]) - set(result["Symbol"]))
+        missing_path = OUTPUT_DIR / f"missing_symbols_{target_session.isoformat()}.txt"
+        missing_path.write_text("\n".join(missing) + "\n")
+        raise RuntimeError(
+            f"Only {coverage:.1%} of NSE mainboard symbols have the target EOD session "
+            f"{target_session}. Required >=95%; refusing to publish an incomplete CSV. "
+            f"Missing symbols saved to {missing_path}."
+        )
+    # Enforce and label the exact prior NSE session, never the workflow run date.
+    dates = result["Date"].dropna().astype(str).unique().tolist()
+    if dates != [target_session.isoformat()]:
+        raise RuntimeError(f"Expected only {target_session}, found dates: {dates[:10]}")
+    eod_date = target_session.isoformat()
     latest = OUTPUT_DIR / "nse_mainboard_eod.csv"
     dated = OUTPUT_DIR / f"nse_mainboard_eod_{eod_date}.csv"
     result.to_csv(latest, index=False, na_rep="")
